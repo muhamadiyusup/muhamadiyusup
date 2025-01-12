@@ -49,17 +49,6 @@ ui <- fluidPage(
                      style = "margin-top: 10px")
       ),
       
-      numericInput("smoothWindow", 
-                   "Smoothing Window Size:", 
-                   value = 3, 
-                   min = 2, 
-                   max = 10),
-      numericInput("outlierThreshold",
-                   "Outlier Threshold (Z-score):",
-                   value = 3,
-                   min = 2,
-                   max = 5),
-      
       tags$hr(),
       tags$div(
         class = "well",

@@ -7,70 +7,12 @@ library(MLmetrics)
 library(DT)
 library(dplyr)
 library(writexl)
-library(zoo)
 
-# Fungsi smoothing dengan moving average
-smooth_mortality_data <- function(data, window_size = 3) {
-  if (nrow(data) < window_size) return(data)
-  
-  data <- data[order(data$Age, data$Year),]
-  
-  smoothed_data <- data %>%
-    group_by(Age) %>%
-    mutate(
-      Rate = if(n() >= window_size) 
-        zoo::rollmean(Rate, k = window_size, fill = "extend")
-      else 
-        Rate
-    ) %>%
-    ungroup()
-  
-  return(smoothed_data)
-}
-
-# Fungsi penanganan outlier
-handle_outliers <- function(data, threshold = 3) {
-  if (nrow(data) < 2) return(data)
-  
-  data <- data %>%
-    group_by(Age) %>%
-    mutate(
-      zscore = if(n() > 1) abs(scale(Rate)) else 0,
-      Rate = ifelse(zscore > threshold, median(Rate), Rate)
-    ) %>%
-    select(-zscore) %>%
-    ungroup()
-  
-  return(data)
-}
-
-# Fungsi utama preprocessing
-preprocess_mortality_data <- function(data, smooth_window = 3, outlier_threshold = 3) {
-  # Validasi input data
-  if (nrow(data) == 0 || ncol(data) == 0) {
-    stop("Data input kosong")
-  }
-  
-  # Konversi ke numerik dan handle NA
-  data$Rate <- as.numeric(data$Rate)
-  
-  # Set nilai default untuk NA
-  default_rate <- 0.001
-  data$Rate[is.na(data$Rate)] <- default_rate
-  
-  # Pastikan nilai minimum
-  min_threshold <- 0.0001
-  data$Rate <- pmax(data$Rate, min_threshold)
-  
-  # Handle outliers dengan validasi
-  if (length(unique(data$Age)) > 1) {
-    data <- handle_outliers(data, outlier_threshold)
-  }
-  
-  # Terapkan smoothing jika data cukup
-  if (nrow(data) >= smooth_window) {
-    data <- smooth_mortality_data(data, smooth_window)
-  }
+# Tambahkan fungsi ini
+preprocess_mortality_data <- function(data) {
+  # Convert rates yang terlalu kecil
+  min_threshold <- 0.0001  # threshold untuk nilai minimum yang masuk akal
+  data$Rate <- ifelse(data$Rate < min_threshold, min_threshold, data$Rate)
   
   return(data)
 }
@@ -454,11 +396,12 @@ server <- function(input, output, session) {
   
   # Function to clean CSV data
   clean_csv_data <- function(data_string) {
-    # Split data
+    # Split data by space and create matrix
     lines <- strsplit(data_string, " ")[[1]]
+    # First line is header
     header <- strsplit(lines[1], ",")[[1]]
     
-    # Proses data lines
+    # Process remaining lines
     data_lines <- lines[-1]
     data_matrix <- do.call(rbind, lapply(data_lines, function(x) {
       if(x != "") {
@@ -466,24 +409,22 @@ server <- function(input, output, session) {
       }
     }))
     
-    # Buat dataframe
+    
+    # Convert to data frame
     data <- as.data.frame(data_matrix, stringsAsFactors = FALSE)
     colnames(data) <- header
     
-    # Konversi tipe data
+    # Convert types
     data$Year <- as.numeric(data$Year)
     data$Age <- as.numeric(data$Age)
     data$Rate <- as.numeric(data$Rate)
     
-    # Terapkan preprocessing
-    preprocessed_data <- preprocess_mortality_data(
-      data,
-      smooth_window = 3,      # Sesuaikan parameter ini
-      outlier_threshold = 3   # Sesuaikan parameter ini
-    )
+    # Add preprocessing
+    data <- preprocess_mortality_data(data)
     
-    return(preprocessed_data)
+    return(data)
   }
+  
   
   # Handler untuk tombol Calculate CSV MAPE
   observeEvent(input$calculateCSV, {
@@ -500,12 +441,6 @@ server <- function(input, output, session) {
         data <- clean_csv_data(raw_content)
         showNotification("CSV data cleaned and processed", type = "message")
         
-        # kontrol kepada pengguna untuk mengatur parameter preprocessing
-        preprocessed_data <- preprocess_mortality_data(
-          data,
-          smooth_window = input$smoothWindow,
-          outlier_threshold = input$outlierThreshold
-        )
         
         # Filter data berdasarkan gender yang dipilih
         data_filtered <- data[data$Gender == input$genderCSV, ]
@@ -549,7 +484,7 @@ server <- function(input, output, session) {
             male = exposure_matrix
           ),
           rate = list(
-            female = rate_matrix,  # Gunakan rate_matrix bukan mortality_matrix
+            female = rate_matrix,
             male = rate_matrix
           ),
           years = years,
@@ -563,7 +498,6 @@ server <- function(input, output, session) {
         
         # Convert to StMoMoData
         mortality_data <- StMoMoData(demog_data, series = tolower(input$genderCSV))
-        mortality_matrix <- rate_matrix  # Original matrix
         
         
         # Create mortality matrix for MAPE calculations
@@ -576,46 +510,25 @@ server <- function(input, output, session) {
         exposure_matrix <- matrix(1000, nrow = n_ages, ncol = n_years,
                                   dimnames = list(ages, years))
         
-        
-        if(any(is.na(mortality_data$rate$female)) || any(is.na(mortality_data$rate$male))) {
-          showNotification("Warning: Data contains missing values. Applying fixes.", type = "warning")
-          mortality_data$rate$female[is.na(mortality_data$rate$female)] <- median(mortality_data$rate$female, na.rm = TRUE)
-          mortality_data$rate$male[is.na(mortality_data$rate$male)] <- median(mortality_data$rate$male, na.rm = TRUE)
-        }
-        
         # Lee-Carter model
         incProgress(0.4, detail = "Fitting LC model")
-        LC <- fit(LC, data = mortality_data, years.fit = years, ages.fit = ages,
-                  start.ax = log(apply(mortality_matrix, 1, mean)),
-                  start.bx = rep(0.1, length(ages)),
-                  start.kt = rep(0.1, length(years)),
-                  control = list(maxit = 2000,      # Tingkatkan iterasi maksimum
-                                 epsilon = 1e-6,      # Longgarkan toleransi konvergensi
-                                 trace = FALSE))      # Non-aktifkan trace
+        LC <- lc(link = "log")
+        LC <- fit(LC, data = mortality_data, years.fit = years, ages.fit = ages)
+        m.LC <- fitted(LC, type = "rates")
         
         
         # Renshaw-Haberman model
         incProgress(0.5, detail = "Fitting RH model")
         RH <- rh(link = "log")
-        RH <- fit(RH, data = mortality_data, years.fit = years, ages.fit = ages,
-                  start.ax = log(apply(mortality_matrix, 1, mean)),
-                  start.bx = rep(0.1, length(ages)),
-                  start.kt = rep(0.1, length(years)),
-                  control = list(maxit = 2000, 
-                                 epsilon = 1e-6,
-                                 trace = FALSE))
+        RH <- fit(RH, data = mortality_data, years.fit = years, ages.fit = ages)
+        m.RH <- fitted(RH, type = "rates")
         
         
         # CBD model
         incProgress(0.6, detail = "Fitting CBD model")
         CBD <- m6(link = "log")
-        CBD <- fit(CBD, data = mortality_data, years.fit = years, ages.fit = ages,
-                   start.ax = log(apply(mortality_matrix, 1, mean)),
-                   start.bx = rep(0.1, length(ages)),
-                   start.kt = matrix(rep(0.1, 2*length(years)), ncol = 2),
-                   control = list(maxit = 2000,
-                                  epsilon = 1e-6,
-                                  trace = FALSE))
+        CBD <- fit(CBD, data = mortality_data, years.fit = years, ages.fit = ages)
+        m.CBD <- fitted(CBD, type = "rates")
         
         
         # Tree improvements
@@ -623,31 +536,32 @@ server <- function(input, output, session) {
         
         
         # LC with Decision Tree
-        dx.LC <- as.vector(m.LC * exposure_matrix)
-        dx <- as.vector(mortality_matrix * exposure_matrix)
+        dx.LC <- m.LC * exposure_matrix
+        dx <- mortality_matrix * exposure_matrix
+        years_rep <- rep(years, each = n_ages)
+        ages_rep <- rep(ages, n_years)
+        cohort <- years_rep - ages_rep
+        
+        
         tree <- rpart(cbind(dx.LC, dx) ~ ages_rep + years_rep + cohort,
                       data = data.frame(
-                        dx = dx,
-                        dx.LC = dx.LC,
+                        dx = as.vector(dx),
+                        dx.LC = as.vector(dx.LC),
                         ages_rep = ages_rep,
                         years_rep = years_rep,
                         cohort = cohort
                       ),
-                      method = "poisson", 
-                      cp = 2e-3,
-                      control = rpart.control(minbucket = 30))
+                      method = "poisson", cp = 2e-3, control = rpart.control(minbucket = 30))
         mu <- predict(tree)
-        m.LCDT <- matrix(mu * as.vector(m.LC), 
-                         nrow = n_ages,
-                         ncol = n_years)
+        m.LCDT <- matrix(mu * as.vector(m.LC), nrow = n_ages)
         
         
         # RH with Decision Tree
-        dx.RH <- as.vector(m.RH * exposure_matrix)
+        dx.RH <- m.RH * exposure_matrix
         tree2 <- rpart(cbind(dx.RH, dx) ~ ages_rep + years_rep + cohort,
                        data = data.frame(
-                         dx = dx,
-                         dx.RH = dx.RH,
+                         dx = as.vector(dx),
+                         dx.RH = as.vector(dx.RH),
                          ages_rep = ages_rep,
                          years_rep = years_rep,
                          cohort = cohort
@@ -655,16 +569,14 @@ server <- function(input, output, session) {
                        method = "poisson",
                        cp = 2e-3)
         mu2 <- predict(tree2)
-        m.RHDT <- matrix(mu2 * as.vector(m.RH),
-                         nrow = n_ages,
-                         ncol = n_years)
+        m.RHDT <- matrix(mu2 * as.vector(m.RH), nrow = n_ages)
         
         # CBD with Decision Tree
-        dx.CBD <- as.vector(m.CBD * exposure_matrix)
+        dx.CBD <- m.CBD * exposure_matrix
         tree3 <- rpart(cbind(dx.CBD, dx) ~ ages_rep + years_rep + cohort,
                        data = data.frame(
-                         dx = dx,
-                         dx.CBD = dx.CBD,
+                         dx = as.vector(dx),
+                         dx.CBD = as.vector(dx.CBD),
                          ages_rep = ages_rep,
                          years_rep = years_rep,
                          cohort = cohort
@@ -672,34 +584,25 @@ server <- function(input, output, session) {
                        method = "poisson",
                        cp = 2e-3)
         mu3 <- predict(tree3)
-        m.CBDDT <- matrix(mu3 * as.vector(m.CBD),
-                          nrow = n_ages,
-                          ncol = n_years)
-        
-        if(any(is.na(mortality_data$rate$female)) || any(is.na(mortality_data$rate$male))) {
-          showNotification("Warning: Data contains missing values. Applying fixes.", type = "warning")
-          mortality_data$rate$female[is.na(mortality_data$rate$female)] <- median(mortality_data$rate$female, na.rm = TRUE)
-          mortality_data$rate$male[is.na(mortality_data$rate$male)] <- median(mortality_data$rate$male, na.rm = TRUE)
-        }
+        m.CBDDT <- matrix(mu3 * as.vector(m.CBD), nrow = n_ages)
         
         # Lee-Carter model
         incProgress(0.4, detail = "Fitting LC model")
         LC <- lc(link = "log")
-        LC <- fit(LC, data = mortality_data, years.fit = years, ages.fit = ages,
-                  control = list(maxit = 2000, epsilon = 1e-6))
+        LC <- fit(LC, data = mortality_data, years.fit = years, ages.fit = ages)
         m.LC <- fitted(LC, type = "rates")
         
         # Renshaw-Haberman model
         incProgress(0.5, detail = "Fitting RH model")
-        RH <- fit(RH, data = mortality_data, years.fit = years, ages.fit = ages,
-                  control = list(maxit = 2000, epsilon = 1e-6))
+        RH <- rh(link = "log")
+        RH <- fit(RH, data = mortality_data, years.fit = years, ages.fit = ages)
         m.RH <- fitted(RH, type = "rates")
         
         
         # CBD model
         incProgress(0.6, detail = "Fitting CBD model")
-        CBD <- fit(CBD, data = mortality_data, years.fit = years, ages.fit = ages,
-                   control = list(maxit = 2000, epsilon = 1e-6))
+        CBD <- m6(link = "log")
+        CBD <- fit(CBD, data = mortality_data, years.fit = years, ages.fit = ages)
         m.CBD <- fitted(CBD, type = "rates")
         
         # Tree improvements
@@ -711,28 +614,26 @@ server <- function(input, output, session) {
         cohort <- years_rep - ages_rep
         
         # LC with Decision Tree
-        dx.LC <- as.vector(m.LC * exposure_matrix)
-        dx <- as.vector(mortality_matrix * exposure_matrix)
-        
+        dx.LC <- m.LC * exposure_matrix
+        dx <- mortality_matrix * exposure_matrix
         tree <- rpart(cbind(dx.LC, dx) ~ ages_rep + years_rep + cohort,
                       data = data.frame(
-                        dx = dx,
-                        dx.LC = dx.LC,
+                        dx = as.vector(dx),
+                        dx.LC = as.vector(dx.LC),
                         ages_rep = ages_rep,
                         years_rep = years_rep,
                         cohort = cohort
                       ),
-                      method = "poisson", 
-                      cp = 2e-3)
+                      method = "poisson", cp = 2e-3, control = rpart.control(minbucket = 30))
         mu <- predict(tree)
-        m.LCDT <- matrix(mu * as.vector(m.LC), nrow = n_ages, ncol = n_years)
+        m.LCDT <- matrix(mu * as.vector(m.LC), nrow = n_ages)
         
         # RH with Decision Tree
-        dx.RH <- as.vector(m.RH * exposure_matrix)
+        dx.RH <- m.RH * exposure_matrix
         tree2 <- rpart(cbind(dx.RH, dx) ~ ages_rep + years_rep + cohort,
                        data = data.frame(
-                         dx = dx,
-                         dx.RH = dx.RH,
+                         dx = as.vector(dx),
+                         dx.RH = as.vector(dx.RH),
                          ages_rep = ages_rep,
                          years_rep = years_rep,
                          cohort = cohort
@@ -740,14 +641,14 @@ server <- function(input, output, session) {
                        method = "poisson",
                        cp = 2e-3)
         mu2 <- predict(tree2)
-        m.RHDT <- matrix(mu2 * as.vector(m.RH), nrow = n_ages, ncol = n_years)
+        m.RHDT <- matrix(mu2 * as.vector(m.RH), nrow = n_ages)
         
         # CBD with Decision Tree
-        dx.CBD <- as.vector(m.CBD * exposure_matrix)
+        dx.CBD <- m.CBD * exposure_matrix
         tree3 <- rpart(cbind(dx.CBD, dx) ~ ages_rep + years_rep + cohort,
                        data = data.frame(
-                         dx = dx,
-                         dx.CBD = dx.CBD,
+                         dx = as.vector(dx),
+                         dx.CBD = as.vector(dx.CBD),
                          ages_rep = ages_rep,
                          years_rep = years_rep,
                          cohort = cohort
@@ -755,7 +656,7 @@ server <- function(input, output, session) {
                        method = "poisson",
                        cp = 2e-3)
         mu3 <- predict(tree3)
-        m.CBDDT <- matrix(mu3 * as.vector(m.CBD), nrow = n_ages, ncol = n_years)
+        m.CBDDT <- matrix(mu3 * as.vector(m.CBD), nrow = n_ages)
         
         
         # Calculate MAPE
